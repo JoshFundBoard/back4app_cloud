@@ -1,4 +1,4 @@
-const MINPLACE = 800;
+const MINPLACE = 1000;
 
 function errorStr(str, err) {
   return `${str} - ${err.code ? err.code : ''} ${err.message ? err.message : ''}`;
@@ -17,6 +17,35 @@ async function getOrCreateOwnObject(className, currentUser) {
   }
 
   return obj;
+}
+
+// get more than 1000 results from http://blog.benoitvallon.com/tips/the-parse-1000-objects-limit/
+function simpleQuery(query, batchNumber) {
+  query.limit(1000);
+  if (batchNumber) query.skip(batchNumber * 1000);
+
+  return query.find().then(
+    function(objects) {
+      return objects;
+    },
+    function(error) {
+      return error;
+    }
+  );
+}
+
+function recursiveQuery(query, batchNumber = 0, allObjects) {
+  return simpleQuery(query, batchNumber).then(function(objects) {
+    // concat the intermediate objects into the final array
+    allObjects = allObjects.concat(objects);
+    // if the objects length is 1000, it means that we are not at the end of the list
+    if (objects.length === 1000) {
+      batchNumber +=1;
+      return recursiveQuery(query, batchNumber, allObjects);
+    } else {
+      return allObjects;
+    }
+  });
 }
 
 Parse.Cloud.define('initUser', async(request) => {
@@ -211,7 +240,6 @@ Parse.Cloud.define('bulkAddInvestors',async(request) => {
   } catch (error){
     throw new Error(errorStr('BulkAddInvestor error', error));
   }
-
 })
 
 Parse.Cloud.define('updateInvestor', async(request) => {
@@ -323,10 +351,17 @@ Parse.Cloud.define('getFoundersByPermalink', async(request) => {
 
 Parse.Cloud.define('getStartups', async(request) => {
   const params = request.params;
-  const { permalinks, uuids } = params;
+  const {
+    permalinks,
+    uuids,
+    page,
+    includeFounders,
+  } = params;
 
   const StartupsObj = Parse.Object.extend('StartupsCB');
   const sQuery = new Parse.Query(StartupsObj);
+  sQuery.limit(1000);
+  if (page) sQuery.skip(1000 * page);
 
   const Founders = Parse.Object.extend('FoundersCB');
   const fQuery = new Parse.Query(Founders);
@@ -336,15 +371,16 @@ Parse.Cloud.define('getStartups', async(request) => {
       sQuery.containedIn('permalink', permalinks);
     } else if(Array.isArray(uuids) && uuids.length) {
       sQuery.containedIn('uuid', uuids);
-    } else {
-      throw new Error('Must include an array of permalinks or uuids in parameters');
     }
+    // If no parameters are given, return all startups.
 
     const sResult = await sQuery.find({ useMasterKey: true });
+    // const startupResults = [];
+    // const sResult = await recursiveQuery(sQuery, 0, startupResults);
     const startupsArr = [];
     for (result of sResult) {
       const startupJSON = { ...result.attributes };
-      if (startupJSON.founder_permalinks) {
+      if (startupJSON.founder_permalinks && includeFounders) {
         const fLinks = startupJSON.founder_permalinks.split(',');
         fQuery.containedIn('permalink', fLinks);
         await fQuery.find({useMasterKey: true}).then(fResults => {
@@ -358,3 +394,68 @@ Parse.Cloud.define('getStartups', async(request) => {
     throw new Error(errorStr('GetStartups error', error));
   }
 });
+
+Parse.Cloud.define('addOrUpdateStartup',async(request) => {
+  const params = request.params;
+  const { uuid, permalink } = params;
+
+  const Startup = Parse.Object.extend('StartupsCB');
+  const query = new Parse.Query(Startup);
+  if (permalink) {
+    query.equalTo('permalink', permalink);
+  } else {
+    query.equalTo('uuid', uuid);
+  }
+
+  let startup = await query.first({ useMasterKey: true });
+
+  if(!startup || Object.keys(startup).length === 0) {
+    startup = new Startup();
+  }
+  startup.set(params);
+  try {
+    await startup.save(null, { useMasterKey: true});
+    return startup;
+  } catch (error){
+    throw new Error(errorStr('addOrUpdateStartup error', error));
+  }
+})
+
+async function addOrUpdateFounder(params) {
+  const Founder = Parse.Object.extend('FoundersCB');
+  const query = new Parse.Query(Founder);
+  query.equalTo('permalink', params.permalink);
+
+  let founder = await query.first({ useMasterKey: true });
+
+  // Only add the founder if they don't exist yet.
+  if(!founder || Object.keys(founder).length === 0) {
+    founder = new Founder();
+  }
+  founder.set(params);
+  try {
+    await founder.save(null, { useMasterKey: true});
+    return founder;
+  } catch (error){
+    throw new Error(errorStr('addOrUpdateFounder error', error));
+  }
+}
+
+Parse.Cloud.define('addOrUpdateFoundersByStartup',async(request) => {
+  const params = request.params;
+  const { founders = [], founded_org_uuid } = params;
+
+  try {
+    const addFounders = founders.map(async f => {
+      const fData = {
+        ...f,
+        founded_org_uuid: founded_org_uuid || f.founded_org_uuid,
+      }
+      return await addOrUpdateFounder(fData);
+    });
+    const completedFounders = await Promise.all(addFounders);
+    return completedFounders;
+  } catch (error){
+    throw new Error(errorStr('addOrUpdateFoundersByStartup error', error));
+  }
+})

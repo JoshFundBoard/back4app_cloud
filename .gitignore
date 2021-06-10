@@ -1,0 +1,5 @@
+# IDE
+.idea
+.idea/
+/.idea/vcs.xml
+/package.json
